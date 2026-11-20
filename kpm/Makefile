@@ -1,12 +1,14 @@
-ifndef TARGET_COMPILE
-    $(error TARGET_COMPILE not set)
-endif
-
 ifndef KP_DIR
     KP_DIR = ../vendor/KernelPatch
 endif
 
-CC = $(TARGET_COMPILE)gcc
+# Allow CC to be overridden from the command line (CI passes an absolute path).
+ifeq ($(origin CC),default)
+    ifndef TARGET_COMPILE
+        $(error TARGET_COMPILE not set)
+    endif
+    CC = $(TARGET_COMPILE)gcc
+endif
 
 CFLAGS += -nostdinc
 CFLAGS += -fno-pic -fno-PIC -fno-pie -fno-stack-protector
