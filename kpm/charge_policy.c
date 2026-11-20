@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.4.0");
+KPM_VERSION("0.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -55,17 +55,20 @@ KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery 
 #define KICK_SOC_MAX      65
 #define KICK_TEMP_MAX_DC  380
 #define KICK_EVERY_N      4
-#define KICK_MAX_FAILS    30
+#define KICK_MAX_TRIES    20
 
 static int enabled;            /* 0 = pass-through */
 static int saw9v;              /* a 9000mV request has succeeded */
 static int rewrite_count;
 static int kick_countdown;
-static int kick_fails;
+static int kick_tries;
 
 static void *pdo_fn;
 static void *icl_fn;
 static void *upd_fn;
+static void (*suspend_fn)(void);
+static void (*unsuspend_fn)(void);
+static void (*msleep_fn)(unsigned int);
 static int (*vbus_vol_fn)(void);
 static int (*ui_soc_fn)(void);
 static int (*batt_volt_fn)(void);
@@ -162,22 +165,32 @@ static void maybe_kick_9v(void)
 {
 	int ret;
 
-	if (!enabled || saw9v || kick_fails >= KICK_MAX_FAILS)
+	if (!enabled || !pdo_fn || !vbus_vol_fn)
 		return;
-	if (!pdo_fn || !vbus_vol_fn)
-		return;
+	/* Already on a 9V-level VBUS: nothing to do. */
 	if (vbus_vol_fn() >= 7000)
+		return;
+	if (kick_tries >= KICK_MAX_TRIES)
 		return;
 	if (!safe_to_kick())
 		return;
 	if (--kick_countdown > 0)
 		return;
 	kick_countdown = KICK_EVERY_N;
+	kick_tries++;
 
+	/* Mirror what oplus_chg_set_pd_config() does around a 9V request:
+	 * drop the load while the source changes voltage.
+	 */
+	if (suspend_fn)
+		suspend_fn();
 	ret = ((int (*)(int, int))pdo_fn)(9000, 2000);
-	if (ret)
-		kick_fails++;
-	pr_info(TAG "request 9V ourselves, ret=%d fails=%d\n", ret, kick_fails);
+	if (msleep_fn)
+		msleep_fn(300);
+	if (unsuspend_fn)
+		unsuspend_fn();
+
+	pr_info(TAG "request 9V ourselves, ret=%d try=%d\n", ret, kick_tries);
 }
 
 /* Runs once per OPLUS_CHG periodic work, outside any charger/PD lock. */
@@ -224,9 +237,13 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 	ui_soc_fn = (int (*)(void))kallsyms_lookup_name("oplus_chg_get_ui_soc");
 	batt_volt_fn = (int (*)(void))kallsyms_lookup_name("oplus_chg_get_batt_volt");
 	batt_temp_fn = (int (*)(void))kallsyms_lookup_name("oplus_get_report_batt_temp");
+	suspend_fn = (void (*)(void))kallsyms_lookup_name("oplus_chg_suspend_charger");
+	unsuspend_fn = (void (*)(void))kallsyms_lookup_name("oplus_chg_unsuspend_charger");
+	msleep_fn = (void (*)(unsigned int))kallsyms_lookup_name("msleep");
 
-	pr_info(TAG "symbols: vbus=%d soc=%d vbat=%d temp=%d icl=%d\n",
-		!!vbus_vol_fn, !!ui_soc_fn, !!batt_volt_fn, !!batt_temp_fn, !!icl_fn);
+	pr_info(TAG "symbols: vbus=%d soc=%d vbat=%d temp=%d icl=%d susp=%d msleep=%d\n",
+		!!vbus_vol_fn, !!ui_soc_fn, !!batt_volt_fn, !!batt_temp_fn, !!icl_fn,
+		!!suspend_fn, !!msleep_fn);
 
 	err = hook_wrap2(pdo_fn, before_select, after_select, 0);
 	if (err != HOOK_NO_ERR) {
