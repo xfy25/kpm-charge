@@ -1,26 +1,22 @@
 /*
- * kpm-charge: keep the PD 9V contract on OnePlus 8T (sm8250, 4.19.322).
+ * kpm-charge 0.9.0-t1: 5V/3A experiment.
  *
- * Background:
- *   oplus_chg_set_pd_config() drops to 5V when
- *       chip->batt_volt > chip->limits.vbatt_pdqc_to_5v_thr
- *   The battery on this unit is degraded (SOH ~50%), so 51% SOC already
- *   reads ~4.1V/cell, which trips the guard a few seconds after plug-in.
+ * What we learned with 0.8.0 (measured on device):
+ *   - Holding/kicking 9V above ~4.1V/cell does not charge the 2S pack at
+ *     all: VBUS sags to 8.28-8.66V, i.e. below the charging pack voltage,
+ *     so the buck hiccups (ibus 43mA with 1A bursts) and ibat stays ~0.
+ *   - Without the KPM the vendor falls back to 5V/2A and the boost charger
+ *     pushes 0.75-0.8A into the pack (~7W). That is why the earlier
+ *     "battery is nearly full" reading at 66% was wrong.
  *
- * Strategy:
- *   - hook oplus_pdo_select(vbus_mv, ibus_ma) and swallow the 5000/2000
- *     request while a healthy 9V contract is active.
- *   - hook mp2650_input_current_limit_write(current_ma) to enforce a
- *     2000mA floor, covering both the 500mA pre-write of the 5V branch
- *     and the lower limit OPLUS applies while the screen is on.
+ * This build therefore does NOT touch the voltage policy at all. It only
+ * tests whether the 5V rail can be pushed from 2A to 3A (adapter allows
+ * 5V/3A here: pd_current_max/hw_current_max report 3000000):
+ *   - rewrite the vendor's pdo_select(5000, 2000) request to 3000mA
+ *   - raise mp2650 input-current-limit writes to 3000mA while on 5V
+ *     (2000mA while a 9V contract is in place, as before)
  *
- * Safety:
- *   - hooks are installed at load but only act when `enabled` is set
- *     (enabled by default; load args / ctl0 "off" disables).
- *   - only rewrite when a real 9V contract succeeded before (saw9v).
- *   - bails out at SOC >= 80, battery temp >= 42C, batt volt >= 4300mV,
- *     or VBUS outside 7.8-9.8V.
- *   - never writes boot/dtbo/vendor; unload or reboot removes everything.
+ * Everything is reversible: unload or reboot restores the vendor policy.
  */
 
 #include <compiler.h>
@@ -33,47 +29,25 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.8.0");
+KPM_VERSION("0.9.0-t1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
-KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
+KPM_DESCRIPTION("Test: raise the PD 5V rail from 2A to 3A on OnePlus 8T");
 
 #define TAG "[kpm-charge] "
 
-#define VBUS_MIN_MV   7800
-#define VBUS_MAX_MV   9800
-#define SOC_MAX       80
-#define TEMP_MAX_DC   420      /* 0.1 C units; hard stop for any intervention */
-#define TEMP_FLOOR_DC 380      /* do not override current limits above 38.0 C */
-#define BATT_MAX_MV   4300
-#define ICL_FLOOR_MA  2000
+#define TEMP_MAX_DC   420      /* do not raise limits above 42.0 C */
+#define ICL_5V_MA     3000
+#define ICL_9V_MA     2000
 
-/* Policy only asks for 9V while batt_volt < qcom,vbatt_pdqc_to_9v_thr
- * (4000mV default). A degraded pack crosses that at ~45% SOC, so ask for
- * 9V ourselves, under tighter limits.
- */
-#define KICK_SOC_MAX      80
-#define KICK_TEMP_MAX_DC  380
-#define KICK_EVERY_N      4
-#define KICK_MAX_TRIES    20
-
-static int enabled;            /* 0 = pass-through */
-static int saw9v;              /* a 9000mV request has succeeded */
+static int enabled;
+static int seen_5v;            /* logged the PDO state once */
 static int rewrite_count;
-static int kick_countdown;
-static int kick_tries;
-static int in_kick;            /* bypass the ICL floor during a kick */
+static int icl_count;
 
 static void *pdo_fn;
 static void *icl_fn;
-static void *upd_fn;
-static void *pd_cfg_fn;
-static void (*suspend_fn)(void);
-static void (*unsuspend_fn)(void);
-static void (*msleep_fn)(unsigned int);
 static int (*vbus_vol_fn)(void);
-static int (*ui_soc_fn)(void);
-static int (*batt_volt_fn)(void);
 static int (*batt_temp_fn)(void);
 
 static int str_has(const char *s, const char *needle)
@@ -91,34 +65,9 @@ static int str_has(const char *s, const char *needle)
 	return 0;
 }
 
-static int safe_to_keep_9v(void)
+static int on_9v(void)
 {
-	int v;
-
-	if (ui_soc_fn) {
-		v = ui_soc_fn();
-		if (v >= SOC_MAX)
-			return 0;
-	}
-	if (batt_temp_fn) {
-		v = batt_temp_fn();
-		if (v >= TEMP_MAX_DC)
-			return 0;
-	}
-	if (batt_volt_fn) {
-		v = batt_volt_fn();
-		if (v >= BATT_MAX_MV)
-			return 0;
-	}
-	if (vbus_vol_fn) {
-		v = vbus_vol_fn();
-		if (v < VBUS_MIN_MV || v > VBUS_MAX_MV) {
-			if (v < 7000)
-				saw9v = 0;
-			return 0;
-		}
-	}
-	return 1;
+	return vbus_vol_fn && vbus_vol_fn() >= 7000;
 }
 
 static void before_select(hook_fargs2_t *a, void *ud)
@@ -126,122 +75,47 @@ static void before_select(hook_fargs2_t *a, void *ud)
 	int vbus = (int)a->arg0;
 	int ibus = (int)a->arg1;
 
-	if (!enabled || !saw9v)
+	if (!enabled)
 		return;
 	if (vbus != 5000 || ibus != 2000)
 		return;
-	if (!safe_to_keep_9v())
-		return;
 
-	/* We are already on a healthy 9V contract: pretend the 5V request
-	 * succeeded instead of re-negotiating every few seconds.
-	 */
-	a->skip_origin = 1;
-	a->ret = 0;
+	a->arg1 = ICL_5V_MA;
 	rewrite_count++;
-	pr_info(TAG "keep 9V, skip 5000/2000 request (n=%d)\n", rewrite_count);
+	pr_info(TAG "5V request %d -> %d mA (n=%d)\n", ibus, ICL_5V_MA,
+		rewrite_count);
 }
 
 static void after_select(hook_fargs2_t *a, void *ud)
 {
-	if ((int)a->arg0 == 9000 && (long)a->ret == 0)
-		saw9v = 1;
+	if ((int)a->arg0 == 5000 && !seen_5v) {
+		seen_5v = 1;
+		pr_info(TAG "pdo_select 5000/%d ret=%ld, vbus=%d\n",
+			(int)a->arg1, (long)a->ret, vbus_vol_fn ? vbus_vol_fn() : -1);
+	}
 }
 
-static int safe_to_kick(void)
-{
-	if (ui_soc_fn && ui_soc_fn() >= KICK_SOC_MAX)
-		return 0;
-	if (batt_temp_fn && batt_temp_fn() >= KICK_TEMP_MAX_DC)
-		return 0;
-	if (batt_volt_fn && batt_volt_fn() >= BATT_MAX_MV)
-		return 0;
-	return 1;
-}
-
-/* Ask the PD engine for 9V even though the OPLUS policy skipped its own
- * request because batt_volt is above qcom,vbatt_pdqc_to_9v_thr.
- * Rate limited; gives up after KICK_MAX_FAILS rejections.
+/* Runs on every mp2650_input_current_limit_write. The vendor asks for
+ * 500mA right before the 5V branch suspends the charger and for 2000mA in
+ * steady state; both are lifted to 3000mA while we are on 5V.
  */
-static void maybe_kick_9v(void)
-{
-	int ret;
-
-	if (!enabled || !pdo_fn || !vbus_vol_fn)
-		return;
-	/* Already on a 9V-level VBUS: nothing to do. */
-	if (vbus_vol_fn() >= 7000)
-		return;
-	if (kick_tries >= KICK_MAX_TRIES)
-		return;
-	if (!safe_to_kick())
-		return;
-	if (--kick_countdown > 0)
-		return;
-	kick_countdown = KICK_EVERY_N;
-	kick_tries++;
-
-	/* Do NOT suspend the charger: that moves the PD engine out of
-	 * PE_SNK_READY and the next oplus_pdo_select() returns -EBUSY.
-	 * Instead drop the input current for the voltage transition.
-	 */
-	in_kick = 1;
-	if (icl_fn)
-		((int (*)(int))icl_fn)(500);
-	ret = ((int (*)(int, int))pdo_fn)(9000, 2000);
-	if (msleep_fn)
-		msleep_fn(300);
-	if (icl_fn)
-		((int (*)(int))icl_fn)(ICL_FLOOR_MA);
-	in_kick = 0;
-
-	pr_info(TAG "request 9V ourselves, ret=%d try=%d\n", ret, kick_tries);
-}
-
-/* Runs once per OPLUS_CHG periodic work, outside any charger/PD lock. */
-static void after_update_work(hook_fargs1_t *a, void *ud)
-{
-	maybe_kick_9v();
-}
-
-/* Skip the whole pd-config pass while 9V is healthy. This is what stops the
- * 6.5s "drop to 5V" cycle: without it, the 5V branch still runs
- * input_current_write(500) + suspend/resume even though its PDO request is
- * swallowed, and the rail visibly oscillates.
- */
-static void before_pd_config(hook_fargs0_t *a, void *ud)
-{
-	if (!enabled || !saw9v)
-		return;
-	if (!safe_to_keep_9v())
-		return;
-
-	a->skip_origin = 1;
-	a->ret = 0;
-	pr_info(TAG "keep 9V, skip pd_config pass\n");
-}
-
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
 	int cur = (int)a->arg0;
+	int target;
 
-	if (in_kick)
-		return;            /* our own 500/2000 writes during a kick */
-
-	if (!enabled || !saw9v)
+	if (!enabled)
 		return;
-	if (cur >= ICL_FLOOR_MA)
+	target = on_9v() ? ICL_9V_MA : ICL_5V_MA;
+	if (cur >= target)
 		return;
-	if (!safe_to_keep_9v())
-		return;
-	/* Do not fight real thermal limiting: only enforce the floor while the
-	 * pack is comfortably cool.
-	 */
-	if (batt_temp_fn && batt_temp_fn() >= TEMP_FLOOR_DC)
+	if (batt_temp_fn && batt_temp_fn() >= TEMP_MAX_DC)
 		return;
 
-	pr_info(TAG "raise input limit %d -> %d mA\n", cur, ICL_FLOOR_MA);
-	a->arg0 = ICL_FLOOR_MA;
+	icl_count++;
+	pr_info(TAG "raise input limit %d -> %d mA (n=%d)\n", cur, target,
+		icl_count);
+	a->arg0 = target;
 }
 
 static long charge_init(const char *args, const char *event, void *__user reserved)
@@ -259,16 +133,9 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 	}
 
 	vbus_vol_fn = (int (*)(void))kallsyms_lookup_name("mp2650_get_vbus_voltage");
-	ui_soc_fn = (int (*)(void))kallsyms_lookup_name("oplus_chg_get_ui_soc");
-	batt_volt_fn = (int (*)(void))kallsyms_lookup_name("oplus_chg_get_batt_volt");
 	batt_temp_fn = (int (*)(void))kallsyms_lookup_name("oplus_get_report_batt_temp");
-	suspend_fn = (void (*)(void))kallsyms_lookup_name("oplus_chg_suspend_charger");
-	unsuspend_fn = (void (*)(void))kallsyms_lookup_name("oplus_chg_unsuspend_charger");
-	msleep_fn = (void (*)(unsigned int))kallsyms_lookup_name("msleep");
-
-	pr_info(TAG "symbols: vbus=%d soc=%d vbat=%d temp=%d icl=%d susp=%d msleep=%d\n",
-		!!vbus_vol_fn, !!ui_soc_fn, !!batt_volt_fn, !!batt_temp_fn, !!icl_fn,
-		!!suspend_fn, !!msleep_fn);
+	pr_info(TAG "symbols: vbus=%d temp=%d icl=%d\n",
+		!!vbus_vol_fn, !!batt_temp_fn, !!icl_fn);
 
 	err = hook_wrap2(pdo_fn, before_select, after_select, 0);
 	if (err != HOOK_NO_ERR) {
@@ -282,33 +149,6 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 			pr_err(TAG "hook mp2650_input_current_limit_write failed: %d\n", err);
 	}
 
-	upd_fn = (void *)kallsyms_lookup_name("oplus_chg_update_work");
-	if (!upd_fn)
-		upd_fn = (void *)kallsyms_lookup_name("oplus_chg_pdqc_to_normal");
-	if (upd_fn) {
-		err = hook_wrap1(upd_fn, 0, after_update_work, 0);
-		if (err != HOOK_NO_ERR) {
-			pr_err(TAG "hook update_work failed: %d\n", err);
-			upd_fn = 0;
-		}
-	} else {
-		pr_err(TAG "update_work symbol not found, 9V kick disabled\n");
-	}
-
-	pd_cfg_fn = (void *)kallsyms_lookup_name("oplus_chg_set_pd_config");
-	if (pd_cfg_fn) {
-		err = hook_wrap0(pd_cfg_fn, before_pd_config, 0, 0);
-		if (err != HOOK_NO_ERR) {
-			pr_err(TAG "hook oplus_chg_set_pd_config failed: %d\n", err);
-			pd_cfg_fn = 0;
-		}
-	} else {
-		pr_err(TAG "oplus_chg_set_pd_config not found\n");
-	}
-
-	/* Enabled by default so the APatch GUI "Load" (no args) works;
-	 * pass "off" as load args (or ctl0 off) to load in pass-through mode.
-	 */
 	enabled = str_has(args, "off") ? 0 : 1;
 	pr_info(TAG "loaded, enabled=%d\n", enabled);
 	return 0;
@@ -316,13 +156,12 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 
 static long charge_ctl0(const char *args, char *__user out_msg, int outlen)
 {
-	if (str_has(args, "on")) {
+	if (str_has(args, "on"))
 		enabled = 1;
-	} else if (str_has(args, "off")) {
+	else if (str_has(args, "off"))
 		enabled = 0;
-	}
-	pr_info(TAG "ctl: args=%s enabled=%d saw9v=%d rewrites=%d\n",
-		args ? args : "(null)", enabled, saw9v, rewrite_count);
+	pr_info(TAG "ctl: args=%s enabled=%d rewrites=%d icl=%d\n",
+		args ? args : "(null)", enabled, rewrite_count, icl_count);
 	return 0;
 }
 
@@ -332,10 +171,6 @@ static long charge_exit(void *__user reserved)
 		hook_unwrap(pdo_fn, before_select, after_select);
 	if (icl_fn)
 		hook_unwrap(icl_fn, before_icl, 0);
-	if (upd_fn)
-		hook_unwrap(upd_fn, 0, after_update_work);
-	if (pd_cfg_fn)
-		hook_unwrap(pd_cfg_fn, before_pd_config, 0);
 	pr_info(TAG "exit\n");
 	return 0;
 }
