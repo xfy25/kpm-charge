@@ -27,12 +27,13 @@ GitHub Actions builds it (`.github/workflows/build.yml`); the artifact lands in
 ## Load (APatch manager, runtime "Load")
 
 1. `adb push dist/charge_policy.kpm /data/local/tmp/`
-2. APatch manager -> KPM -> Load, args `on`
-3. or with the superkey:
+2. APatch manager -> KPM -> Load (no args needed; enabled by default)
+3. pass `off` as load args to load in pass-through (logging only) mode
+4. or with the superkey:
    `/system/bin/truncate <superkey> module load /data/local/tmp/charge_policy.kpm on`
-4. disable at runtime: `truncate <superkey> module ctl0 kpm-charge off`
-5. unload: `truncate <superkey> module unload kpm-charge`
-6. a normal reboot removes it (runtime load is not persisted)
+5. disable at runtime: `truncate <superkey> module ctl0 kpm-charge off`
+6. unload: `truncate <superkey> module unload kpm-charge`
+7. a normal reboot removes it (runtime load is not persisted)
 
 Never embed this into boot.img.
 

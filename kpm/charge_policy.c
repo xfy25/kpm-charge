@@ -172,7 +172,10 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 			pr_err(TAG "hook mp2650_input_current_limit_write failed: %d\n", err);
 	}
 
-	enabled = str_has(args, "on") ? 1 : 0;
+	/* Enabled by default so the APatch GUI "Load" (no args) works;
+	 * pass "off" as load args (or ctl0 off) to load in pass-through mode.
+	 */
+	enabled = str_has(args, "off") ? 0 : 1;
 	pr_info(TAG "loaded, enabled=%d\n", enabled);
 	return 0;
 }
