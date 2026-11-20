@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.7.0");
+KPM_VERSION("0.8.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -67,6 +67,7 @@ static int in_kick;            /* bypass the ICL floor during a kick */
 static void *pdo_fn;
 static void *icl_fn;
 static void *upd_fn;
+static void *pd_cfg_fn;
 static void (*suspend_fn)(void);
 static void (*unsuspend_fn)(void);
 static void (*msleep_fn)(unsigned int);
@@ -203,6 +204,23 @@ static void after_update_work(hook_fargs1_t *a, void *ud)
 	maybe_kick_9v();
 }
 
+/* Skip the whole pd-config pass while 9V is healthy. This is what stops the
+ * 6.5s "drop to 5V" cycle: without it, the 5V branch still runs
+ * input_current_write(500) + suspend/resume even though its PDO request is
+ * swallowed, and the rail visibly oscillates.
+ */
+static void before_pd_config(hook_fargs0_t *a, void *ud)
+{
+	if (!enabled || !saw9v)
+		return;
+	if (!safe_to_keep_9v())
+		return;
+
+	a->skip_origin = 1;
+	a->ret = 0;
+	pr_info(TAG "keep 9V, skip pd_config pass\n");
+}
+
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
 	int cur = (int)a->arg0;
@@ -277,6 +295,17 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 		pr_err(TAG "update_work symbol not found, 9V kick disabled\n");
 	}
 
+	pd_cfg_fn = (void *)kallsyms_lookup_name("oplus_chg_set_pd_config");
+	if (pd_cfg_fn) {
+		err = hook_wrap0(pd_cfg_fn, before_pd_config, 0, 0);
+		if (err != HOOK_NO_ERR) {
+			pr_err(TAG "hook oplus_chg_set_pd_config failed: %d\n", err);
+			pd_cfg_fn = 0;
+		}
+	} else {
+		pr_err(TAG "oplus_chg_set_pd_config not found\n");
+	}
+
 	/* Enabled by default so the APatch GUI "Load" (no args) works;
 	 * pass "off" as load args (or ctl0 off) to load in pass-through mode.
 	 */
@@ -305,6 +334,8 @@ static long charge_exit(void *__user reserved)
 		hook_unwrap(icl_fn, before_icl, 0);
 	if (upd_fn)
 		hook_unwrap(upd_fn, 0, after_update_work);
+	if (pd_cfg_fn)
+		hook_unwrap(pd_cfg_fn, before_pd_config, 0);
 	pr_info(TAG "exit\n");
 	return 0;
 }
