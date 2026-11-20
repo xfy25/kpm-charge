@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.5.0");
+KPM_VERSION("0.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -52,7 +52,7 @@ KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery 
  * (4000mV default). A degraded pack crosses that at ~45% SOC, so ask for
  * 9V ourselves, under tighter limits.
  */
-#define KICK_SOC_MAX      65
+#define KICK_SOC_MAX      80
 #define KICK_TEMP_MAX_DC  380
 #define KICK_EVERY_N      4
 #define KICK_MAX_TRIES    20
