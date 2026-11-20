@@ -4,7 +4,8 @@ REPO="/mnt/c/Users/Tsu Uyjief/AppData/Roaming/CherryStudio/Data/Agents/system/20
 cd "$REPO"
 git config user.name "siu"
 git config user.email "xfy25@outlook.com"
+git pull --rebase origin main || true
 git add -A
-git commit -m "build: allow CC override" || true
+git commit -m "update kpm" || true
 git push origin main
 echo PUSH_OK
