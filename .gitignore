@@ -1,0 +1,5 @@
+*.o
+*.kpm
+vendor/
+arm-gnu-toolchain-*/
+tc.tar.xz

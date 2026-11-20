@@ -1,0 +1,52 @@
+name: build-kpm
+
+on:
+  push:
+    paths-ignore:
+      - 'dist/**'
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone KernelPatch (KPM SDK headers)
+        run: git clone --depth 1 https://github.com/bmax121/KernelPatch.git vendor/KernelPatch
+
+      - name: Fetch ARM GNU bare-metal toolchain 12.2.rel1
+        run: |
+          curl -fsSL -o tc.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -xf tc.tar.xz
+          ls -d arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf
+
+      - name: Build KPM
+        run: |
+          make -C kpm \
+            KP_DIR="$GITHUB_WORKSPACE/vendor/KernelPatch" \
+            CC="$GITHUB_WORKSPACE/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-gcc"
+          file kpm/charge_policy.kpm
+          ls -l kpm/charge_policy.kpm
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp kpm/charge_policy.kpm dist/charge_policy.kpm
+
+      - name: Commit artifact
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dist/charge_policy.kpm
+          if git diff --cached --quiet; then
+            echo "artifact unchanged"
+            exit 0
+          fi
+          git commit -m "build: update charge_policy.kpm [skip ci]"
+          git push
