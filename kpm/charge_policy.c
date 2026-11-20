@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.2.0");
+KPM_VERSION("0.3.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -48,9 +48,20 @@ KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery 
 #define BATT_MAX_MV   4300
 #define ICL_FLOOR_MA  2000
 
+/* Policy only asks for 9V while batt_volt < qcom,vbatt_pdqc_to_9v_thr
+ * (4000mV default). A degraded pack crosses that at ~45% SOC, so ask for
+ * 9V ourselves, under tighter limits.
+ */
+#define KICK_SOC_MAX      65
+#define KICK_TEMP_MAX_DC  380
+#define KICK_EVERY_N      6
+#define KICK_MAX_FAILS    30
+
 static int enabled;            /* 0 = pass-through */
 static int saw9v;              /* a 9000mV request has succeeded */
 static int rewrite_count;
+static int kick_countdown;
+static int kick_fails;
 
 static void *pdo_fn;
 static void *icl_fn;
@@ -131,9 +142,48 @@ static void after_select(hook_fargs2_t *a, void *ud)
 		saw9v = 1;
 }
 
+static int safe_to_kick(void)
+{
+	if (ui_soc_fn && ui_soc_fn() >= KICK_SOC_MAX)
+		return 0;
+	if (batt_temp_fn && batt_temp_fn() >= KICK_TEMP_MAX_DC)
+		return 0;
+	if (batt_volt_fn && batt_volt_fn() >= BATT_MAX_MV)
+		return 0;
+	return 1;
+}
+
+/* Ask the PD engine for 9V even though the OPLUS policy skipped its own
+ * request because batt_volt is above qcom,vbatt_pdqc_to_9v_thr.
+ * Rate limited; gives up after KICK_MAX_FAILS rejections.
+ */
+static void maybe_kick_9v(void)
+{
+	int ret;
+
+	if (!enabled || saw9v || kick_fails >= KICK_MAX_FAILS)
+		return;
+	if (!pdo_fn || !vbus_vol_fn)
+		return;
+	if (vbus_vol_fn() >= 7000)
+		return;
+	if (!safe_to_kick())
+		return;
+	if (--kick_countdown > 0)
+		return;
+	kick_countdown = KICK_EVERY_N;
+
+	ret = ((int (*)(int, int))pdo_fn)(9000, 2000);
+	if (ret)
+		kick_fails++;
+	pr_info(TAG "request 9V ourselves, ret=%d fails=%d\n", ret, kick_fails);
+}
+
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
 	int cur = (int)a->arg0;
+
+	maybe_kick_9v();
 
 	if (!enabled || !saw9v)
 		return;

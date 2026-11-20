@@ -11,9 +11,13 @@ APatch KernelPatch Module for OnePlus 8T (sm8250, kernel 4.19.322, Nameless AOSP
 
 This KPM keeps the 9V contract:
 
-- hooks `oplus_pdo_select(vbus_mv, ibus_ma)` and rewrites `5000/2000` to `9000/2000`
-- hooks `mp2650_input_current_limit_write(current_ma)` so the 500 mA pre-write of the
-  5V branch becomes 1500 mA
+- hooks `oplus_pdo_select(vbus_mv, ibus_ma)` and swallows the `5000/2000` request
+  while a healthy 9V contract is active (`skip_origin`)
+- hooks `mp2650_input_current_limit_write(current_ma)` and enforces a 2000 mA floor,
+  covering the 500 mA pre-write of the 5V branch and the lower screen-on limit
+- v0.3.0: asks for 9V itself (rate-limited) because the stock policy only requests
+  9V while `batt_volt < qcom,vbatt_pdqc_to_9v_thr` (4000 mV), which a degraded pack
+  crosses around 45% SOC
 
 Safety gates: only acts when `enabled`, only after a 9V request has succeeded,
 and only while SOC < 80, battery temp < 42.0 C, batt voltage < 4300 mV,
