@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.6.0");
+KPM_VERSION("0.7.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -62,6 +62,7 @@ static int saw9v;              /* a 9000mV request has succeeded */
 static int rewrite_count;
 static int kick_countdown;
 static int kick_tries;
+static int in_kick;            /* bypass the ICL floor during a kick */
 
 static void *pdo_fn;
 static void *icl_fn;
@@ -179,16 +180,19 @@ static void maybe_kick_9v(void)
 	kick_countdown = KICK_EVERY_N;
 	kick_tries++;
 
-	/* Mirror what oplus_chg_set_pd_config() does around a 9V request:
-	 * drop the load while the source changes voltage.
+	/* Do NOT suspend the charger: that moves the PD engine out of
+	 * PE_SNK_READY and the next oplus_pdo_select() returns -EBUSY.
+	 * Instead drop the input current for the voltage transition.
 	 */
-	if (suspend_fn)
-		suspend_fn();
+	in_kick = 1;
+	if (icl_fn)
+		((int (*)(int))icl_fn)(500);
 	ret = ((int (*)(int, int))pdo_fn)(9000, 2000);
 	if (msleep_fn)
 		msleep_fn(300);
-	if (unsuspend_fn)
-		unsuspend_fn();
+	if (icl_fn)
+		((int (*)(int))icl_fn)(ICL_FLOOR_MA);
+	in_kick = 0;
 
 	pr_info(TAG "request 9V ourselves, ret=%d try=%d\n", ret, kick_tries);
 }
@@ -202,6 +206,9 @@ static void after_update_work(hook_fargs1_t *a, void *ud)
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
 	int cur = (int)a->arg0;
+
+	if (in_kick)
+		return;            /* our own 500/2000 writes during a kick */
 
 	if (!enabled || !saw9v)
 		return;
