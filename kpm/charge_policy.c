@@ -33,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.3.0");
+KPM_VERSION("0.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -54,7 +54,7 @@ KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery 
  */
 #define KICK_SOC_MAX      65
 #define KICK_TEMP_MAX_DC  380
-#define KICK_EVERY_N      6
+#define KICK_EVERY_N      4
 #define KICK_MAX_FAILS    30
 
 static int enabled;            /* 0 = pass-through */
@@ -65,6 +65,7 @@ static int kick_fails;
 
 static void *pdo_fn;
 static void *icl_fn;
+static void *upd_fn;
 static int (*vbus_vol_fn)(void);
 static int (*ui_soc_fn)(void);
 static int (*batt_volt_fn)(void);
@@ -179,11 +180,15 @@ static void maybe_kick_9v(void)
 	pr_info(TAG "request 9V ourselves, ret=%d fails=%d\n", ret, kick_fails);
 }
 
+/* Runs once per OPLUS_CHG periodic work, outside any charger/PD lock. */
+static void after_update_work(hook_fargs1_t *a, void *ud)
+{
+	maybe_kick_9v();
+}
+
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
 	int cur = (int)a->arg0;
-
-	maybe_kick_9v();
 
 	if (!enabled || !saw9v)
 		return;
@@ -235,6 +240,19 @@ static long charge_init(const char *args, const char *event, void *__user reserv
 			pr_err(TAG "hook mp2650_input_current_limit_write failed: %d\n", err);
 	}
 
+	upd_fn = (void *)kallsyms_lookup_name("oplus_chg_update_work");
+	if (!upd_fn)
+		upd_fn = (void *)kallsyms_lookup_name("oplus_chg_pdqc_to_normal");
+	if (upd_fn) {
+		err = hook_wrap1(upd_fn, 0, after_update_work, 0);
+		if (err != HOOK_NO_ERR) {
+			pr_err(TAG "hook update_work failed: %d\n", err);
+			upd_fn = 0;
+		}
+	} else {
+		pr_err(TAG "update_work symbol not found, 9V kick disabled\n");
+	}
+
 	/* Enabled by default so the APatch GUI "Load" (no args) works;
 	 * pass "off" as load args (or ctl0 off) to load in pass-through mode.
 	 */
@@ -261,6 +279,8 @@ static long charge_exit(void *__user reserved)
 		hook_unwrap(pdo_fn, before_select, after_select);
 	if (icl_fn)
 		hook_unwrap(icl_fn, before_icl, 0);
+	if (upd_fn)
+		hook_unwrap(upd_fn, 0, after_update_work);
 	pr_info(TAG "exit\n");
 	return 0;
 }
