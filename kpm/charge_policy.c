@@ -8,14 +8,15 @@
  *   reads ~4.1V/cell, which trips the guard a few seconds after plug-in.
  *
  * Strategy:
- *   - hook oplus_pdo_select(vbus_mv, ibus_ma) and rewrite the 5000/2000
- *     request back to 9000/2000, gated on SOC/temp/voltage.
- *   - hook mp2650_input_current_limit_write(current_ma) so the 500mA
- *     pre-write of the 5V branch becomes 1500mA instead.
+ *   - hook oplus_pdo_select(vbus_mv, ibus_ma) and swallow the 5000/2000
+ *     request while a healthy 9V contract is active.
+ *   - hook mp2650_input_current_limit_write(current_ma) to enforce a
+ *     2000mA floor, covering both the 500mA pre-write of the 5V branch
+ *     and the lower limit OPLUS applies while the screen is on.
  *
  * Safety:
  *   - hooks are installed at load but only act when `enabled` is set
- *     (load args contain "on", or ctl0 "on").
+ *     (enabled by default; load args / ctl0 "off" disables).
  *   - only rewrite when a real 9V contract succeeded before (saw9v).
  *   - bails out at SOC >= 80, battery temp >= 42C, batt volt >= 4300mV,
  *     or VBUS outside 7.8-9.8V.
@@ -32,7 +33,7 @@
 #include <common.h>
 
 KPM_NAME("kpm-charge");
-KPM_VERSION("0.1.0");
+KPM_VERSION("0.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xfy25");
 KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery voltage");
@@ -42,9 +43,10 @@ KPM_DESCRIPTION("Keep PD 9V contract when OPLUS falls back to 5V on low battery 
 #define VBUS_MIN_MV   7800
 #define VBUS_MAX_MV   9800
 #define SOC_MAX       80
-#define TEMP_MAX_DC   420      /* 0.1 C units */
+#define TEMP_MAX_DC   420      /* 0.1 C units; hard stop for any intervention */
+#define TEMP_FLOOR_DC 380      /* do not override current limits above 38.0 C */
 #define BATT_MAX_MV   4300
-#define ICL_TARGET_MA 1500
+#define ICL_FLOOR_MA  2000
 
 static int enabled;            /* 0 = pass-through */
 static int saw9v;              /* a 9000mV request has succeeded */
@@ -114,9 +116,13 @@ static void before_select(hook_fargs2_t *a, void *ud)
 	if (!safe_to_keep_9v())
 		return;
 
-	a->arg0 = 9000;
+	/* We are already on a healthy 9V contract: pretend the 5V request
+	 * succeeded instead of re-negotiating every few seconds.
+	 */
+	a->skip_origin = 1;
+	a->ret = 0;
 	rewrite_count++;
-	pr_info(TAG "rewrite pdo 5000/2000 -> 9000/2000 (n=%d)\n", rewrite_count);
+	pr_info(TAG "keep 9V, skip 5000/2000 request (n=%d)\n", rewrite_count);
 }
 
 static void after_select(hook_fargs2_t *a, void *ud)
@@ -127,15 +133,22 @@ static void after_select(hook_fargs2_t *a, void *ud)
 
 static void before_icl(hook_fargs1_t *a, void *ud)
 {
+	int cur = (int)a->arg0;
+
 	if (!enabled || !saw9v)
 		return;
-	if ((int)a->arg0 > 500)
+	if (cur >= ICL_FLOOR_MA)
 		return;
 	if (!safe_to_keep_9v())
 		return;
+	/* Do not fight real thermal limiting: only enforce the floor while the
+	 * pack is comfortably cool.
+	 */
+	if (batt_temp_fn && batt_temp_fn() >= TEMP_FLOOR_DC)
+		return;
 
-	a->arg0 = ICL_TARGET_MA;
-	pr_info(TAG "raise input limit 500 -> %d mA\n", ICL_TARGET_MA);
+	pr_info(TAG "raise input limit %d -> %d mA\n", cur, ICL_FLOOR_MA);
+	a->arg0 = ICL_FLOOR_MA;
 }
 
 static long charge_init(const char *args, const char *event, void *__user reserved)
